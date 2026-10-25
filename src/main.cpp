@@ -1,91 +1,200 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <algorithm>
+#include <deque>
+#include <map>
+#include <vector>
 
 using namespace geode::prelude;
 
-namespace pb {
-    inline bool pending = false;
-    inline bool releaseQueued = false;
-    inline bool releaseNext = false;
+namespace sc {
+    struct Snap { int frame; CheckpointObject* cp; bool held; float dt; };
+
+    inline std::deque<Snap> snaps;
+    inline std::map<int, bool> inputs;
+    inline std::map<int, bool> forced;
+    inline int  frame = 0;
+    inline int  forcedUntil = 0;
+    inline bool busy = false;
+    inline bool failed = false;
     inline bool injecting = false;
-    inline int  age = 0;
+    inline bool pending = false;
+    inline bool held = false;
+    inline GameObject* killer = nullptr;
 
     inline bool enabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
-    inline int  ticks()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("ticks")); }
-    inline void reset()   { pending = releaseQueued = releaseNext = injecting = false; age = 0; }
+    inline int  setting(char const* k) { return static_cast<int>(Mod::get()->getSettingValue<int64_t>(k)); }
 
-    inline bool holdMode(PlayerObject* p) {
-        return p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing;
+    inline void clearSnaps() {
+        for (auto& s : snaps) s.cp->release();
+        snaps.clear();
     }
-    inline bool canAct(PlayerObject* p) {
-        if (!p) return true;
-        if (holdMode(p)) return true;
-        if (p->m_isOnGround) return true;
-        return p->m_touchingRings && p->m_touchingRings->count() > 0;
+    inline void resetAll() {
+        clearSnaps();
+        inputs.clear(); forced.clear();
+        frame = 0; forcedUntil = 0;
+        busy = failed = injecting = pending = held = false;
+        killer = nullptr;
     }
 }
 
-class $modify(PBBase, GJBaseGameLayer) {
+class $modify(SCBase, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (!pb::enabled() || pb::injecting || button != 1 || !isPlayer1 || !m_player1) {
-            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        if (sc::enabled() && !sc::injecting && button == 1 && isPlayer1) {
+            if (sc::busy) return;
+            if (sc::frame < sc::forcedUntil) return;
+            sc::inputs[sc::frame] = down;
+            sc::held = down;
         }
-        if (down) {
-            if (pb::canAct(m_player1)) {
-                pb::pending = false;
-                return GJBaseGameLayer::handleButton(true, button, isPlayer1);
-            }
-            pb::pending = true;
-            pb::releaseQueued = false;
-            pb::age = 0;
-            return;
-        }
-        if (pb::pending) { pb::releaseQueued = true; return; }
-        GJBaseGameLayer::handleButton(false, button, isPlayer1);
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 };
 
-class $modify(PBLayer, PlayLayer) {
+class $modify(SCLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        pb::reset();
+        sc::resetAll();
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         m_isTestMode = true;
         return true;
     }
 
     void resetLevel() {
-        pb::reset();
+        sc::resetAll();
         PlayLayer::resetLevel();
     }
 
-    void inject(bool down) {
-        pb::injecting = true;
-        static_cast<GJBaseGameLayer*>(this)->handleButton(down, 1, true);
-        pb::injecting = false;
+    void onQuit() {
+        sc::resetAll();
+        PlayLayer::onQuit();
     }
 
-    void update(float dt) {
-        if (pb::enabled()) {
-            if (pb::releaseNext) {
-                pb::releaseNext = false;
-                inject(false);
-            }
-            if (pb::pending) {
-                pb::age++;
-                if (pb::canAct(m_player1)) {
-                    pb::pending = false;
-                    inject(true);
-                    if (pb::releaseQueued) {
-                        pb::releaseQueued = false;
-                        pb::releaseNext = true;
+    void inject(bool down) {
+        sc::injecting = true;
+        static_cast<GJBaseGameLayer*>(this)->handleButton(down, 1, true);
+        sc::injecting = false;
+        sc::held = down;
+    }
+
+    float dtFor(int f) {
+        auto& S = sc::snaps;
+        if (S.empty()) return 1.f / 60.f;
+        int idx = f - S.front().frame;
+        if (idx >= 0 && idx < (int)S.size()) return S[idx].dt;
+        return S.back().dt;
+    }
+
+    bool simulate(std::map<int, bool> const& in, int endFrame, int fromFrame) {
+        auto& S = sc::snaps;
+        if (S.empty()) return false;
+        int idx = std::clamp(fromFrame - S.front().frame, 0, (int)S.size() - 1);
+        auto& first = S[idx];
+        PlayLayer::loadFromCheckpoint(first.cp);
+        sc::busy = true;
+        sc::failed = false;
+        inject(first.held);
+        for (int f = first.frame; f < endFrame && !sc::failed; f++) {
+            auto it = in.find(f);
+            if (it != in.end()) inject(it->second);
+            PlayLayer::update(dtFor(f));
+        }
+        sc::busy = false;
+        return !sc::failed;
+    }
+
+    bool correct() {
+        auto& S = sc::snaps;
+        if (S.size() < 3) return false;
+
+        int deathFrame = sc::frame;
+        int startFrame = S.front().frame;
+        int maxShift = sc::setting("max-shift");
+        int maxClicks = sc::setting("max-clicks");
+        int extra = sc::setting("extra");
+
+        std::vector<int> ev;
+        for (auto& [f, d] : sc::inputs) if (f >= startFrame) ev.push_back(f);
+        if (ev.empty()) return false;
+
+        for (int s = 1; s <= maxShift; s++) {
+            for (int sign : {1, -1}) {
+                for (int group = 1; group <= std::min<int>(maxClicks, ev.size()); group++) {
+                    auto in = sc::inputs;
+                    int delta = sign * s;
+                    std::vector<std::pair<int, bool>> moved;
+                    for (int k = 0; k < group; k++) {
+                        int f = ev[ev.size() - 1 - k];
+                        moved.push_back({f, in[f]});
+                        in.erase(f);
                     }
-                } else if (pb::age > pb::ticks()) {
-                    pb::pending = false;
-                    if (pb::releaseQueued) pb::releaseQueued = false;
+                    bool ok = true;
+                    int fromFrame = deathFrame;
+                    for (auto& [f, d] : moved) {
+                        int nf = f + delta;
+                        if (nf < startFrame || nf >= deathFrame + extra || in.count(nf)) { ok = false; break; }
+                        in[nf] = d;
+                        fromFrame = std::min({fromFrame, f, nf});
+                    }
+                    if (!ok) continue;
+
+                    if (!simulate(in, deathFrame + extra, fromFrame)) continue;
+
+                    simulate(in, deathFrame, fromFrame);
+                    sc::inputs.clear();
+                    sc::forced.clear();
+                    for (auto& [f, d] : in) {
+                        if (f < deathFrame) sc::inputs[f] = d;
+                        else sc::forced[f] = d;
+                    }
+                    sc::forcedUntil = sc::forced.empty() ? deathFrame : sc::forced.rbegin()->first + 1;
+                    sc::clearSnaps();
+                    return true;
                 }
             }
         }
+
+        simulate(sc::inputs, deathFrame, startFrame);
+        sc::clearSnaps();
+        return false;
+    }
+
+    void destroyPlayer(PlayerObject* player, GameObject* obj) {
+        if (!sc::enabled() || obj == m_anticheatSpike || !m_player1) {
+            return PlayLayer::destroyPlayer(player, obj);
+        }
+        if (sc::busy) { sc::failed = true; return; }
+        sc::pending = true;
+        sc::killer = obj;
+    }
+
+    void update(float dt) {
+        if (!sc::enabled() || sc::busy) return PlayLayer::update(dt);
+
+        if (sc::pending) {
+            sc::pending = false;
+            if (!correct()) {
+                PlayLayer::destroyPlayer(m_player1, sc::killer);
+                return;
+            }
+        }
+
+        auto it = sc::forced.find(sc::frame);
+        if (it != sc::forced.end()) inject(it->second);
+
+        auto* cp = PlayLayer::createCheckpoint();
+        if (cp) {
+            cp->retain();
+            sc::snaps.push_back({sc::frame, cp, sc::held, dt});
+            while ((int)sc::snaps.size() > sc::setting("window")) {
+                sc::snaps.front().cp->release();
+                sc::snaps.pop_front();
+            }
+        }
+
         PlayLayer::update(dt);
+        sc::frame++;
+
+        while (!sc::inputs.empty() && sc::inputs.begin()->first < sc::frame - 120)
+            sc::inputs.erase(sc::inputs.begin());
     }
 };
