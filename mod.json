@@ -1,0 +1,13 @@
+{
+  "geode": "4.6.0",
+  "gd": { "android": "2.2081", "win": "2.2081" },
+  "id": "martin.predictive-buffer-android",
+  "name": "Input Buffer (Android)",
+  "version": "v1.0.0",
+  "developer": "Martin Elias",
+  "description": "Buffer de clicks: si presionas unos ticks antes de tiempo, el click se guarda y se ejecuta al aterrizar o tocar un orb.",
+  "settings": {
+    "enabled": { "type": "bool", "name": "Activado", "default": true },
+    "ticks": { "type": "int", "name": "Ticks de buffer", "description": "Etapas del original: 2, 4, 8, 16, 24, 32, 48, 54, 60", "default": 4, "min": 1, "max": 60, "control": { "slider": true } }
+  }
+}
