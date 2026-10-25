@@ -1,13 +1,16 @@
 {
   "geode": "5.11.2",
   "gd": { "android": "2.2081", "win": "2.2081" },
-  "id": "martin.predictive-buffer-android",
-  "name": "Input Buffer (Android)",
-  "version": "v1.0.0",
+  "id": "martin.second-chance",
+  "name": "Second Chance",
+  "version": "v2.2.0",
   "developer": "Martin Elias",
-  "description": "Buffer de clicks: si presionas unos ticks antes de tiempo, el click se guarda y se ejecuta al aterrizar o tocar un orb.",
+  "description": "Si vas a morir por un click mal temporizado, el mod retrocede unos frames y prueba mover tu click hasta encontrar uno que sobreviva.",
   "settings": {
     "enabled": { "type": "bool", "name": "Activado", "default": true },
-    "ticks": { "type": "int", "name": "Ticks de buffer", "description": "Etapas del original: 2, 4, 8, 16, 24, 32, 48, 54, 60", "default": 4, "min": 1, "max": 60, "control": { "slider": true } }
+    "window": { "type": "int", "name": "Ventana de retroceso (frames)", "default": 50, "min": 6, "max": 60, "control": { "slider": true } },
+    "max-shift": { "type": "int", "name": "Corrección máxima (frames)", "default": 3, "min": 1, "max": 6, "control": { "slider": true } },
+    "max-clicks": { "type": "int", "name": "Clicks a corregir (últimos)", "description": "1-2 para cubo/ball/ufo. 3-4 para wave y ship, pero usa más CPU.", "default": 2, "min": 1, "max": 4, "control": { "slider": true } },
+    "extra": { "type": "int", "name": "Frames a verificar tras el choque", "default": 8, "min": 4, "max": 20, "control": { "slider": true } }
   }
 }
