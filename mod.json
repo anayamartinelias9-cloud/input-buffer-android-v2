@@ -3,18 +3,21 @@
   "gd": { "android": "2.2081", "win": "2.2081" },
   "id": "martin.second-chance",
   "name": "Second Chance",
-  "version": "v3.0.0",
+  "version": "v3.2.0",
   "developer": "Martin Elias",
-  "description": "Si vas a morir por un click mal temporizado, el mod retrocede, mueve tus clicks o mete uno del bot y sigue el nivel. Valores pensados para 120 fps (a 60 fps usa la mitad).",
+  "description": "Si hiciste un click mal temporizado y vas a morir, el mod retrocede y mueve tu salto al frame exacto para pasar el obstáculo. Sin click tuyo, no hace nada.",
   "settings": {
     "enabled": { "type": "bool", "name": "Activado", "default": true },
     "window": { "type": "int", "name": "Ventana de retroceso (frames)", "default": 60, "min": 6, "max": 120, "control": { "slider": true } },
-    "max-shift": { "type": "int", "name": "Corrección máxima (frames)", "default": 6, "min": 1, "max": 12, "control": { "slider": true } },
-    "max-clicks": { "type": "int", "name": "Clicks a corregir (últimos)", "description": "1-2 para cubo/ball/ufo. 3-4 para wave y ship, pero usa más CPU.", "default": 3, "min": 1, "max": 4, "control": { "slider": true } },
+    "max-shift": { "type": "int", "name": "Corrección máxima (frames)", "default": 8, "min": 1, "max": 16, "control": { "slider": true } },
+    "max-clicks": { "type": "int", "name": "Saltos a corregir (últimos)", "description": "1-2 para cubo/ball/ufo. 3-4 para wave y ship, pero usa más CPU.", "default": 2, "min": 1, "max": 4, "control": { "slider": true } },
+    "click-window": { "type": "int", "name": "Ventana de tus clicks (frames)", "description": "Solo se corrigen clicks tuyos hechos en este lapso antes del choque.", "default": 40, "min": 5, "max": 120, "control": { "slider": true } },
     "extra": { "type": "int", "name": "Frames a verificar tras el choque", "default": 16, "min": 4, "max": 40, "control": { "slider": true } },
+    "bot-insert": { "type": "bool", "name": "El bot mete clicks aunque no hagas click", "default": false },
     "insert-window": { "type": "int", "name": "Ventana del bot (frames atrás)", "default": 60, "min": 6, "max": 120, "control": { "slider": true } },
-    "bot-step": { "type": "int", "name": "Paso del bot (frames)", "description": "Más alto = menos pruebas y menos tirón.", "default": 2, "min": 1, "max": 6, "control": { "slider": true } },
+    "bot-step": { "type": "int", "name": "Paso del bot (frames)", "default": 2, "min": 1, "max": 6, "control": { "slider": true } },
     "max-saves": { "type": "int", "name": "Salvadas por intento", "default": 5, "min": 1, "max": 20, "control": { "slider": true } },
+    "max-teleport": { "type": "int", "name": "Salto máximo permitido (unidades)", "description": "30 = 1 bloque. Más bajo = menos teletransporte, pero menos correcciones.", "default": 45, "min": 10, "max": 200, "control": { "slider": true } },
     "budget-ms": { "type": "int", "name": "Tiempo máximo de búsqueda (ms)", "description": "Si lo supera, mueres normal. Baja esto si notas tirones.", "default": 300, "min": 50, "max": 2000, "control": { "slider": true } }
   }
 }
