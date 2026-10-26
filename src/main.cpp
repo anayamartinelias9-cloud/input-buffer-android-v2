@@ -22,9 +22,10 @@ namespace sc {
     inline int  saves = 0;
     inline bool busy = false;
     inline bool failed = false;
-    inline bool injecting = false;
     inline bool pending = false;
     inline bool held = false;
+    inline bool alive = false;       // el bucle por frame está funcionando
+    inline bool allowDeath = false;  // dejar pasar una muerte real
     inline GameObject* killer = nullptr;
 
     inline bool enabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
@@ -38,28 +39,18 @@ namespace sc {
         clearSnaps();
         inputs.clear(); forced.clear();
         frame = 0; forcedUntil = 0; graceUntil = 0; saves = 0;
-        busy = failed = injecting = pending = held = false;
+        busy = failed = pending = held = allowDeath = false;
         killer = nullptr;
     }
 }
 
-class $modify(SCBase, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (sc::enabled() && !sc::injecting && button == 1 && isPlayer1) {
-            if (sc::busy) return;
-            if (sc::frame < sc::forcedUntil) return;
-            sc::inputs[sc::frame] = down;
-            sc::held = down;
-        }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
-    }
-};
-
-class $modify(SCLayer, PlayLayer) {
+class $modify(SCPlay, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         sc::resetAll();
+        sc::alive = false;
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         m_isTestMode = true;
+        Notification::create("Second Chance cargado", NotificationIcon::Success, 0.8f)->show();
         return true;
     }
 
@@ -73,10 +64,37 @@ class $modify(SCLayer, PlayLayer) {
         PlayLayer::onQuit();
     }
 
+    void destroyPlayer(PlayerObject* player, GameObject* obj) {
+        if (sc::busy) { sc::failed = true; return; }
+
+        // Seguro anti-noclip: solo se tapa la muerte si todo está funcionando
+        if (!sc::enabled() || sc::allowDeath || obj == m_anticheatSpike || !m_player1 ||
+            !sc::alive || sc::snaps.size() < 3 || sc::saves >= sc::setting("max-saves")) {
+            return PlayLayer::destroyPlayer(player, obj);
+        }
+        if (sc::frame < sc::graceUntil) {
+            Notification::create("Second Chance: sin salida", NotificationIcon::Error, 0.4f)->show();
+            return PlayLayer::destroyPlayer(player, obj);
+        }
+        sc::pending = true;
+        sc::killer = obj;
+    }
+};
+
+class $modify(SCBase, GJBaseGameLayer) {
+    // Registra tus clicks reales (los del bot no pasan por aquí)
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (sc::enabled() && button == 1 && isPlayer1) {
+            if (sc::busy) return;
+            if (sc::frame < sc::forcedUntil) return;
+            sc::inputs[sc::frame] = down;
+            sc::held = down;
+        }
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
     void inject(bool down) {
-        sc::injecting = true;
-        static_cast<GJBaseGameLayer*>(this)->handleButton(down, 1, true);
-        sc::injecting = false;
+        GJBaseGameLayer::handleButton(down, 1, true);
         sc::held = down;
     }
 
@@ -88,41 +106,41 @@ class $modify(SCLayer, PlayLayer) {
         return S.back().dt;
     }
 
-    bool simulate(std::map<int, bool> const& in, int endFrame, int fromFrame) {
+    bool simulate(PlayLayer* pl, std::map<int, bool> const& in, int endFrame, int fromFrame) {
         auto& S = sc::snaps;
         if (S.empty()) return false;
         int idx = std::clamp(fromFrame - S.front().frame, 0, (int)S.size() - 1);
         auto& first = S[idx];
-        PlayLayer::loadFromCheckpoint(first.cp);
+        pl->loadFromCheckpoint(first.cp);
         sc::busy = true;
         sc::failed = false;
         inject(first.held);
         for (int f = first.frame; f < endFrame && !sc::failed; f++) {
             auto it = in.find(f);
             if (it != in.end()) inject(it->second);
-            PlayLayer::update(dtFor(f));
+            GJBaseGameLayer::update(dtFor(f));
         }
         sc::busy = false;
         return !sc::failed;
     }
 
-    bool restoreOriginal(int deathFrame, int startFrame) {
-        simulate(sc::inputs, deathFrame, startFrame);
+    bool restoreOriginal(PlayLayer* pl, int deathFrame, int startFrame) {
+        simulate(pl, sc::inputs, deathFrame, startFrame);
         sc::clearSnaps();
         return false;
     }
 
-    bool correct() {
+    bool correct(PlayLayer* pl) {
         auto& S = sc::snaps;
         int deathFrame = sc::frame;
         int startFrame = S.empty() ? 0 : S.front().frame;
 
         if (S.size() < 3 || sc::saves >= sc::setting("max-saves")) {
-            return restoreOriginal(deathFrame, startFrame);
+            return restoreOriginal(pl, deathFrame, startFrame);
         }
 
         // La simulación original TIENE que reproducir la muerte; si no, no es fiable.
-        if (simulate(sc::inputs, deathFrame, startFrame)) {
+        if (simulate(pl, sc::inputs, deathFrame, startFrame)) {
             sc::clearSnaps();
             return false;
         }
@@ -142,8 +160,8 @@ class $modify(SCLayer, PlayLayer) {
         };
 
         auto apply = [&](std::map<int, bool>& in, int fromFrame) -> bool {
-            if (!simulate(in, deathFrame + extra, fromFrame)) return false;
-            simulate(in, deathFrame, fromFrame);
+            if (!simulate(pl, in, deathFrame + extra, fromFrame)) return false;
+            simulate(pl, in, deathFrame, fromFrame);
             sc::inputs.clear();
             sc::forced.clear();
             for (auto& [f, d] : in) {
@@ -165,7 +183,7 @@ class $modify(SCLayer, PlayLayer) {
         for (int s = 1; s <= maxShift && !ev.empty(); s++) {
             for (int sign : {1, -1}) {
                 for (int group = 1; group <= std::min<int>(maxClicks, ev.size()); group++) {
-                    if (timeUp()) return restoreOriginal(deathFrame, startFrame);
+                    if (timeUp()) return restoreOriginal(pl, deathFrame, startFrame);
                     auto in = sc::inputs;
                     int delta = sign * s;
                     std::vector<std::pair<int, bool>> moved;
@@ -201,7 +219,7 @@ class $modify(SCLayer, PlayLayer) {
         for (int t = deathFrame - 1; t >= std::max(startFrame, deathFrame - insertWin); t -= step) {
             bool h0 = heldAt(t);
             for (int h : {2, 6, 12}) {
-                if (timeUp()) return restoreOriginal(deathFrame, startFrame);
+                if (timeUp()) return restoreOriginal(pl, deathFrame, startFrame);
                 int te = t + h;
                 if (te >= deathFrame + extra) continue;
                 bool clash = false;
@@ -216,31 +234,29 @@ class $modify(SCLayer, PlayLayer) {
             }
         }
 
-        return restoreOriginal(deathFrame, startFrame);
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        if (!sc::enabled() || obj == m_anticheatSpike || !m_player1) {
-            return PlayLayer::destroyPlayer(player, obj);
-        }
-        if (sc::busy) { sc::failed = true; return; }
-        if (sc::frame < sc::graceUntil) {
-            Notification::create("Second Chance: sin salida", NotificationIcon::Error, 0.4f)->show();
-            return PlayLayer::destroyPlayer(player, obj);
-        }
-        sc::pending = true;
-        sc::killer = obj;
+        return restoreOriginal(pl, deathFrame, startFrame);
     }
 
     void update(float dt) {
-        if (!sc::enabled() || sc::busy) return PlayLayer::update(dt);
+        auto pl = PlayLayer::get();
+        if (!sc::enabled() || sc::busy || !pl ||
+            static_cast<GJBaseGameLayer*>(pl) != static_cast<GJBaseGameLayer*>(this)) {
+            return GJBaseGameLayer::update(dt);
+        }
+
+        if (!sc::alive) {
+            sc::alive = true;
+            Notification::create("Second Chance: activo", NotificationIcon::Success, 0.6f)->show();
+        }
 
         if (sc::pending) {
             sc::pending = false;
-            if (!correct()) {
+            if (!correct(pl)) {
                 Notification::create("Second Chance: no se pudo corregir", NotificationIcon::Warning, 0.4f)->show();
-                PlayLayer::destroyPlayer(m_player1, sc::killer);
-                return;
+                sc::allowDeath = true;
+                pl->destroyPlayer(pl->m_player1, sc::killer);
+                sc::allowDeath = false;
+                return GJBaseGameLayer::update(dt);
             }
         }
 
@@ -250,7 +266,7 @@ class $modify(SCLayer, PlayLayer) {
             sc::inputs[sc::frame] = it->second;
         }
 
-        auto* cp = PlayLayer::createCheckpoint();
+        auto* cp = pl->createCheckpoint();
         if (cp) {
             cp->retain();
             sc::snaps.push_back({sc::frame, cp, sc::held, dt});
@@ -260,7 +276,7 @@ class $modify(SCLayer, PlayLayer) {
             }
         }
 
-        PlayLayer::update(dt);
+        GJBaseGameLayer::update(dt);
         sc::frame++;
 
         while (!sc::inputs.empty() && sc::inputs.begin()->first < sc::frame - 240)
