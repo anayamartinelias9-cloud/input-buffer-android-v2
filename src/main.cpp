@@ -12,6 +12,7 @@ using namespace geode::prelude;
 
 namespace sc {
     struct Snap { int frame; CheckpointObject* cp; bool held; float dt; };
+    struct Unit { int press; int release; }; // press=-1: ya estaba presionado; release=-1: sigue presionado
 
     inline std::deque<Snap> snaps;
     inline std::map<int, bool> inputs;
@@ -24,8 +25,8 @@ namespace sc {
     inline bool failed = false;
     inline bool pending = false;
     inline bool held = false;
-    inline bool alive = false;       // el bucle por frame está funcionando
-    inline bool allowDeath = false;  // dejar pasar una muerte real
+    inline bool alive = false;
+    inline bool allowDeath = false;
     inline GameObject* killer = nullptr;
 
     inline bool enabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
@@ -82,7 +83,6 @@ class $modify(SCPlay, PlayLayer) {
 };
 
 class $modify(SCBase, GJBaseGameLayer) {
-    // Registra tus clicks reales (los del bot no pasan por aquí)
     void handleButton(bool down, int button, bool isPlayer1) {
         if (sc::enabled() && button == 1 && isPlayer1) {
             if (sc::busy) return;
@@ -134,9 +134,49 @@ class $modify(SCBase, GJBaseGameLayer) {
         auto& S = sc::snaps;
         int deathFrame = sc::frame;
         int startFrame = S.empty() ? 0 : S.front().frame;
+        auto origPos = pl->m_player1->getPosition(); // dónde chocaste
 
         if (S.size() < 3 || sc::saves >= sc::setting("max-saves")) {
             return restoreOriginal(pl, deathFrame, startFrame);
+        }
+
+        int maxShift = sc::setting("max-shift");
+        int maxClicks = sc::setting("max-clicks");
+        int clickWin = sc::setting("click-window");
+        int extra = sc::setting("extra");
+        int insertWin = sc::setting("insert-window");
+        int step = std::max(1, sc::setting("bot-step"));
+        int budget = sc::setting("budget-ms");
+        float maxTele = static_cast<float>(sc::setting("max-teleport"));
+        bool botInsert = Mod::get()->getSettingValue<bool>("bot-insert");
+
+        // Tus saltos = cada click con su soltada
+        std::vector<sc::Unit> all;
+        bool open = false;
+        if (S.front().held) { all.push_back({-1, -1}); open = true; }
+        for (auto& [f, d] : sc::inputs) {
+            if (f < startFrame) continue;
+            if (d) {
+                if (!open) { all.push_back({f, -1}); open = true; }
+            } else if (open && !all.empty() && all.back().release == -1) {
+                all.back().release = f;
+                open = false;
+            }
+        }
+
+        // Solo cuentan tus clicks recientes (dentro de la ventana de clicks)
+        std::vector<sc::Unit> units;
+        for (auto& u : all) {
+            if ((u.press >= 0 && u.press >= deathFrame - clickWin) ||
+                (u.release >= 0 && u.release >= deathFrame - clickWin)) {
+                units.push_back(u);
+            }
+        }
+
+        // Sin click tuyo reciente y el bot apagado: no se hace nada, mueres normal
+        if (units.empty() && !botInsert) {
+            sc::clearSnaps();
+            return false;
         }
 
         // La simulación original TIENE que reproducir la muerte; si no, no es fiable.
@@ -144,13 +184,6 @@ class $modify(SCBase, GJBaseGameLayer) {
             sc::clearSnaps();
             return false;
         }
-
-        int maxShift = sc::setting("max-shift");
-        int maxClicks = sc::setting("max-clicks");
-        int extra = sc::setting("extra");
-        int insertWin = sc::setting("insert-window");
-        int step = std::max(1, sc::setting("bot-step"));
-        int budget = sc::setting("budget-ms");
 
         auto t0 = std::chrono::steady_clock::now();
         auto timeUp = [&]() {
@@ -161,7 +194,9 @@ class $modify(SCBase, GJBaseGameLayer) {
 
         auto apply = [&](std::map<int, bool>& in, int fromFrame) -> bool {
             if (!simulate(pl, in, deathFrame + extra, fromFrame)) return false;
-            simulate(pl, in, deathFrame, fromFrame);
+            if (!simulate(pl, in, deathFrame, fromFrame)) return false;
+            // Sin teletransportes largos
+            if (ccpDistance(pl->m_player1->getPosition(), origPos) > maxTele) return false;
             sc::inputs.clear();
             sc::forced.clear();
             for (auto& [f, d] : in) {
@@ -176,29 +211,32 @@ class $modify(SCBase, GJBaseGameLayer) {
             return true;
         };
 
-        std::vector<int> ev;
-        for (auto& [f, d] : sc::inputs) if (f >= startFrame) ev.push_back(f);
-
-        // 1) Mover tus últimos clicks
-        for (int s = 1; s <= maxShift && !ev.empty(); s++) {
+        // 1) Mover tus últimos saltos conservando cuánto los mantuviste
+        for (int s = 1; s <= maxShift && !units.empty(); s++) {
             for (int sign : {1, -1}) {
-                for (int group = 1; group <= std::min<int>(maxClicks, ev.size()); group++) {
+                for (int group = 1; group <= std::min<int>(maxClicks, units.size()); group++) {
                     if (timeUp()) return restoreOriginal(pl, deathFrame, startFrame);
                     auto in = sc::inputs;
                     int delta = sign * s;
-                    std::vector<std::pair<int, bool>> moved;
+                    int fromFrame = deathFrame;
+                    std::vector<std::pair<int, bool>> add;
                     for (int k = 0; k < group; k++) {
-                        int f = ev[ev.size() - 1 - k];
-                        moved.push_back({f, in[f]});
-                        in.erase(f);
+                        auto& u = units[units.size() - 1 - k];
+                        if (u.press >= 0) {
+                            in.erase(u.press);
+                            add.push_back({u.press + delta, true});
+                            fromFrame = std::min({fromFrame, u.press, u.press + delta});
+                        }
+                        if (u.release >= 0) {
+                            in.erase(u.release);
+                            add.push_back({u.release + delta, false});
+                            fromFrame = std::min({fromFrame, u.release, u.release + delta});
+                        }
                     }
                     bool ok = true;
-                    int fromFrame = deathFrame;
-                    for (auto& [f, d] : moved) {
-                        int nf = f + delta;
+                    for (auto& [nf, d] : add) {
                         if (nf < startFrame || nf >= deathFrame + extra || in.count(nf)) { ok = false; break; }
                         in[nf] = d;
-                        fromFrame = std::min({fromFrame, f, nf});
                     }
                     if (!ok) continue;
                     if (apply(in, fromFrame)) return true;
@@ -206,31 +244,33 @@ class $modify(SCBase, GJBaseGameLayer) {
             }
         }
 
-        // 2) El bot mete un click propio antes de morir
-        auto heldAt = [&](int t) {
-            bool h = S.front().held;
-            for (auto& [f, d] : sc::inputs) {
-                if (f >= t) break;
-                if (f >= startFrame) h = d;
-            }
-            return h;
-        };
-
-        for (int t = deathFrame - 1; t >= std::max(startFrame, deathFrame - insertWin); t -= step) {
-            bool h0 = heldAt(t);
-            for (int h : {2, 6, 12}) {
-                if (timeUp()) return restoreOriginal(pl, deathFrame, startFrame);
-                int te = t + h;
-                if (te >= deathFrame + extra) continue;
-                bool clash = false;
-                for (int f = t; f <= te; f++) {
-                    if (sc::inputs.count(f)) { clash = true; break; }
+        // 2) Solo si lo activaste en los ajustes: el bot mete un salto propio
+        if (botInsert) {
+            auto heldAt = [&](int t) {
+                bool h = S.front().held;
+                for (auto& [f, d] : sc::inputs) {
+                    if (f >= t) break;
+                    if (f >= startFrame) h = d;
                 }
-                if (clash) continue;
-                auto in = sc::inputs;
-                in[t] = !h0;
-                in[te] = h0;
-                if (apply(in, t)) return true;
+                return h;
+            };
+
+            for (int t = deathFrame - 1; t >= std::max(startFrame, deathFrame - insertWin); t -= step) {
+                bool h0 = heldAt(t);
+                for (int h : {2, 6, 12}) {
+                    if (timeUp()) return restoreOriginal(pl, deathFrame, startFrame);
+                    int te = t + h;
+                    if (te >= deathFrame + extra) continue;
+                    bool clash = false;
+                    for (int f = t; f <= te; f++) {
+                        if (sc::inputs.count(f)) { clash = true; break; }
+                    }
+                    if (clash) continue;
+                    auto in = sc::inputs;
+                    in[t] = !h0;
+                    in[te] = h0;
+                    if (apply(in, t)) return true;
+                }
             }
         }
 
