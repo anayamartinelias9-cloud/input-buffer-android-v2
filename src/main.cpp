@@ -1,6 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/ui/Notification.hpp>
 #include <algorithm>
 #include <chrono>
 #include <deque>
@@ -17,6 +18,7 @@ namespace sc {
     inline std::map<int, bool> forced;
     inline int  frame = 0;
     inline int  forcedUntil = 0;
+    inline int  graceUntil = 0;
     inline int  saves = 0;
     inline bool busy = false;
     inline bool failed = false;
@@ -35,7 +37,7 @@ namespace sc {
     inline void resetAll() {
         clearSnaps();
         inputs.clear(); forced.clear();
-        frame = 0; forcedUntil = 0; saves = 0;
+        frame = 0; forcedUntil = 0; graceUntil = 0; saves = 0;
         busy = failed = injecting = pending = held = false;
         killer = nullptr;
     }
@@ -149,8 +151,10 @@ class $modify(SCLayer, PlayLayer) {
                 else sc::forced[f] = d;
             }
             sc::forcedUntil = sc::forced.empty() ? deathFrame : sc::forced.rbegin()->first + 1;
+            sc::graceUntil = deathFrame + extra;
             sc::saves++;
             sc::clearSnaps();
+            Notification::create("Second Chance: click corregido", NotificationIcon::Success, 0.4f)->show();
             return true;
         };
 
@@ -220,6 +224,10 @@ class $modify(SCLayer, PlayLayer) {
             return PlayLayer::destroyPlayer(player, obj);
         }
         if (sc::busy) { sc::failed = true; return; }
+        if (sc::frame < sc::graceUntil) {
+            Notification::create("Second Chance: sin salida", NotificationIcon::Error, 0.4f)->show();
+            return PlayLayer::destroyPlayer(player, obj);
+        }
         sc::pending = true;
         sc::killer = obj;
     }
@@ -230,6 +238,7 @@ class $modify(SCLayer, PlayLayer) {
         if (sc::pending) {
             sc::pending = false;
             if (!correct()) {
+                Notification::create("Second Chance: no se pudo corregir", NotificationIcon::Warning, 0.4f)->show();
                 PlayLayer::destroyPlayer(m_player1, sc::killer);
                 return;
             }
