@@ -2,6 +2,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <vector>
@@ -16,6 +17,7 @@ namespace sc {
     inline std::map<int, bool> forced;
     inline int  frame = 0;
     inline int  forcedUntil = 0;
+    inline int  saves = 0;
     inline bool busy = false;
     inline bool failed = false;
     inline bool injecting = false;
@@ -33,7 +35,7 @@ namespace sc {
     inline void resetAll() {
         clearSnaps();
         inputs.clear(); forced.clear();
-        frame = 0; forcedUntil = 0;
+        frame = 0; forcedUntil = 0; saves = 0;
         busy = failed = injecting = pending = held = false;
         killer = nullptr;
     }
@@ -102,23 +104,64 @@ class $modify(SCLayer, PlayLayer) {
         return !sc::failed;
     }
 
+    bool restoreOriginal(int deathFrame, int startFrame) {
+        simulate(sc::inputs, deathFrame, startFrame);
+        sc::clearSnaps();
+        return false;
+    }
+
     bool correct() {
         auto& S = sc::snaps;
-        if (S.size() < 3) return false;
-
         int deathFrame = sc::frame;
-        int startFrame = S.front().frame;
+        int startFrame = S.empty() ? 0 : S.front().frame;
+
+        if (S.size() < 3 || sc::saves >= sc::setting("max-saves")) {
+            return restoreOriginal(deathFrame, startFrame);
+        }
+
+        // La simulación original TIENE que reproducir la muerte; si no, no es fiable.
+        if (simulate(sc::inputs, deathFrame, startFrame)) {
+            sc::clearSnaps();
+            return false;
+        }
+
         int maxShift = sc::setting("max-shift");
         int maxClicks = sc::setting("max-clicks");
         int extra = sc::setting("extra");
+        int insertWin = sc::setting("insert-window");
+        int step = std::max(1, sc::setting("bot-step"));
+        int budget = sc::setting("budget-ms");
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto timeUp = [&]() {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            return ms > budget;
+        };
+
+        auto apply = [&](std::map<int, bool>& in, int fromFrame) -> bool {
+            if (!simulate(in, deathFrame + extra, fromFrame)) return false;
+            simulate(in, deathFrame, fromFrame);
+            sc::inputs.clear();
+            sc::forced.clear();
+            for (auto& [f, d] : in) {
+                if (f < deathFrame) sc::inputs[f] = d;
+                else sc::forced[f] = d;
+            }
+            sc::forcedUntil = sc::forced.empty() ? deathFrame : sc::forced.rbegin()->first + 1;
+            sc::saves++;
+            sc::clearSnaps();
+            return true;
+        };
 
         std::vector<int> ev;
         for (auto& [f, d] : sc::inputs) if (f >= startFrame) ev.push_back(f);
-        if (ev.empty()) return false;
 
-        for (int s = 1; s <= maxShift; s++) {
+        // 1) Mover tus últimos clicks
+        for (int s = 1; s <= maxShift && !ev.empty(); s++) {
             for (int sign : {1, -1}) {
                 for (int group = 1; group <= std::min<int>(maxClicks, ev.size()); group++) {
+                    if (timeUp()) return restoreOriginal(deathFrame, startFrame);
                     auto in = sc::inputs;
                     int delta = sign * s;
                     std::vector<std::pair<int, bool>> moved;
@@ -136,26 +179,40 @@ class $modify(SCLayer, PlayLayer) {
                         fromFrame = std::min({fromFrame, f, nf});
                     }
                     if (!ok) continue;
-
-                    if (!simulate(in, deathFrame + extra, fromFrame)) continue;
-
-                    simulate(in, deathFrame, fromFrame);
-                    sc::inputs.clear();
-                    sc::forced.clear();
-                    for (auto& [f, d] : in) {
-                        if (f < deathFrame) sc::inputs[f] = d;
-                        else sc::forced[f] = d;
-                    }
-                    sc::forcedUntil = sc::forced.empty() ? deathFrame : sc::forced.rbegin()->first + 1;
-                    sc::clearSnaps();
-                    return true;
+                    if (apply(in, fromFrame)) return true;
                 }
             }
         }
 
-        simulate(sc::inputs, deathFrame, startFrame);
-        sc::clearSnaps();
-        return false;
+        // 2) El bot mete un click propio antes de morir
+        auto heldAt = [&](int t) {
+            bool h = S.front().held;
+            for (auto& [f, d] : sc::inputs) {
+                if (f >= t) break;
+                if (f >= startFrame) h = d;
+            }
+            return h;
+        };
+
+        for (int t = deathFrame - 1; t >= std::max(startFrame, deathFrame - insertWin); t -= step) {
+            bool h0 = heldAt(t);
+            for (int h : {2, 6, 12}) {
+                if (timeUp()) return restoreOriginal(deathFrame, startFrame);
+                int te = t + h;
+                if (te >= deathFrame + extra) continue;
+                bool clash = false;
+                for (int f = t; f <= te; f++) {
+                    if (sc::inputs.count(f)) { clash = true; break; }
+                }
+                if (clash) continue;
+                auto in = sc::inputs;
+                in[t] = !h0;
+                in[te] = h0;
+                if (apply(in, t)) return true;
+            }
+        }
+
+        return restoreOriginal(deathFrame, startFrame);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
@@ -179,7 +236,10 @@ class $modify(SCLayer, PlayLayer) {
         }
 
         auto it = sc::forced.find(sc::frame);
-        if (it != sc::forced.end()) inject(it->second);
+        if (it != sc::forced.end()) {
+            inject(it->second);
+            sc::inputs[sc::frame] = it->second;
+        }
 
         auto* cp = PlayLayer::createCheckpoint();
         if (cp) {
@@ -194,7 +254,7 @@ class $modify(SCLayer, PlayLayer) {
         PlayLayer::update(dt);
         sc::frame++;
 
-        while (!sc::inputs.empty() && sc::inputs.begin()->first < sc::frame - 120)
+        while (!sc::inputs.empty() && sc::inputs.begin()->first < sc::frame - 240)
             sc::inputs.erase(sc::inputs.begin());
     }
 };
